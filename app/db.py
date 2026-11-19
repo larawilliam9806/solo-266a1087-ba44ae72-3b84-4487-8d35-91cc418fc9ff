@@ -2,9 +2,9 @@
 
 设计要点：
 - WAL 模式 + busy_timeout：多读单写，写者排队而不是立即报 SQLITE_BUSY。
-- 每个版本（region 不可变、parcels、well_attributions、meta 指针）在
-  同一个事务里写入，COMMIT 之前对任何读者都不可见 —— 失败或进程被杀
-  时 SQLite 自动回滚，不会留下"半版"。
+- 每个版本（region 不可变、parcels、well_attributions、topo_edges、
+  topo_parcel_refs、meta 指针）在同一个事务里写入，COMMIT 之前对任何读者
+  都不可见 —— 失败或进程被杀时 SQLite 自动回滚，不会留下"半版"。
 - meta.current_revision 是唯一的版本指针；发布时用
   `UPDATE ... WHERE current_revision = :base` 做乐观并发控制，
   同一基版的并发修订只有一份能把这个 UPDATE 做成，其余 rowcount=0 → 409。
@@ -56,6 +56,30 @@ CREATE TABLE IF NOT EXISTS well_attributions (
     candidates TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (revision, well_id)
 );
+
+-- 拓扑边表：每版一份。边号由（规范端点, 相邻宗地组合）决定，跨版稳定；
+-- parcels 为 1~2 个宗地编号的 JSON 数组（升序），1 个表示区域外沿。
+CREATE TABLE IF NOT EXISTS topo_edges (
+    revision INTEGER NOT NULL REFERENCES versions(revision),
+    edge_id  TEXT NOT NULL,
+    x1       INTEGER NOT NULL,
+    y1       INTEGER NOT NULL,
+    x2       INTEGER NOT NULL,
+    y2       INTEGER NOT NULL,
+    parcels  TEXT NOT NULL,
+    PRIMARY KEY (revision, edge_id)
+);
+
+-- 每块宗地的有序、带方向边引用（seq 为环上顺序）。
+CREATE TABLE IF NOT EXISTS topo_parcel_refs (
+    revision  INTEGER NOT NULL REFERENCES versions(revision),
+    parcel_id TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    edge_id   TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('forward', 'reverse')),
+    PRIMARY KEY (revision, parcel_id, seq),
+    FOREIGN KEY (revision, parcel_id) REFERENCES parcels(revision, parcel_id)
+);
 """
 
 
@@ -92,6 +116,8 @@ def init_db() -> None:
             current = row[0]
             conn.execute("BEGIN")
             try:
+                conn.execute("DELETE FROM topo_parcel_refs WHERE revision > ?", (current,))
+                conn.execute("DELETE FROM topo_edges WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM well_attributions WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM parcels WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM versions WHERE revision > ?", (current,))

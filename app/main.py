@@ -1,10 +1,11 @@
-"""FastAPI 入口：版本化发布、整批替换、同版一致性查询。
+"""FastAPI 入口：版本化发布、整批替换、同版一致性查询、拓扑供数。
 
 并发与原子性：
-- 重活（几何核查、井归属重算）在写事务之外基于 base 版本快照完成；
+- 重活（几何核查、井归属重算、拓扑构建）在写事务之外基于 base 版本快照完成；
 - 写事务用 BEGIN IMMEDIATE 串行化，进入后先核对 meta.current_revision
   仍等于 base_revision，不等则回滚返回 409 —— 同版并发修订只成功一份；
-- 版本行、宗地行、井归属行、版本指针在同一个事务里提交，失败/重启不留半版。
+- 版本行、宗地行、井归属行、拓扑行、版本指针在同一个事务里提交，
+  拓扑生成或落库失败即整体回滚，原版继续可读，失败/重启不留半版。
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from fastapi.responses import JSONResponse
 from .db import connect, init_db
 from .geo import attribute_wells, parse_point, parse_polygon, validate_tiling
 from .schemas import InitRequest, ReplaceRequest
+from .topo import TopoError, Topology, build_topology, diff_topology
 
 
 @asynccontextmanager
@@ -33,6 +35,13 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(TopoError)
+async def topo_error_handler(_: Any, exc: TopoError) -> JSONResponse:
+    """拓扑生成失败：本次发布整体回滚（写事务尚未提交或已回滚），原版继续可读。"""
+    return _err(500, {"error": "topology_failed",
+                      "message": f"拓扑生成失败，本次发布已整体回滚：{exc}"})
 
 
 # ---------------------------------------------------------------- 工具
@@ -108,6 +117,57 @@ def _insert_version(conn: sqlite3.Connection, revision: int,
         [(revision, wid, a["status"], a["parcel_id"], json.dumps(a["candidates"]))
          for wid, a in attributions.items()],
     )
+
+
+def _insert_topology(conn: sqlite3.Connection, revision: int, topo: Topology) -> None:
+    """在已开启的事务内写入该版拓扑（与版本其余部分同生共死）。"""
+    conn.executemany(
+        "INSERT INTO topo_edges (revision, edge_id, x1, y1, x2, y2, parcels) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [(revision, e["edge_id"], e["start"][0], e["start"][1],
+          e["end"][0], e["end"][1], json.dumps(e["parcels"]))
+         for e in topo.edges.values()],
+    )
+    conn.executemany(
+        "INSERT INTO topo_parcel_refs (revision, parcel_id, seq, edge_id, direction) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(revision, pid, seq, ref["edge_id"], ref["direction"])
+         for pid, refs in topo.refs.items() for seq, ref in enumerate(refs)],
+    )
+
+
+def _load_topology(conn: sqlite3.Connection, revision: int) -> Optional[Topology]:
+    """读取指定版本的拓扑；该版没有拓扑数据时返回 None。"""
+    edge_rows = conn.execute(
+        "SELECT edge_id, x1, y1, x2, y2, parcels FROM topo_edges "
+        "WHERE revision = ? ORDER BY edge_id",
+        (revision,),
+    ).fetchall()
+    ref_rows = conn.execute(
+        "SELECT parcel_id, edge_id, direction FROM topo_parcel_refs "
+        "WHERE revision = ? ORDER BY parcel_id, seq",
+        (revision,),
+    ).fetchall()
+    if not edge_rows and not ref_rows:
+        return None
+    edges = {
+        r[0]: {"edge_id": r[0], "start": [r[1], r[2]], "end": [r[3], r[4]],
+               "parcels": json.loads(r[5])}
+        for r in edge_rows
+    }
+    refs: dict[str, list[dict]] = {}
+    for r in ref_rows:
+        refs.setdefault(r[0], []).append({"edge_id": r[1], "direction": r[2]})
+    return Topology(edges=edges, refs=refs)
+
+
+def _topology_payload(revision: int, topo: Topology) -> dict:
+    return {
+        "revision": revision,
+        "edges": [topo.edges[e] for e in sorted(topo.edges)],
+        "parcels": [{"parcel_id": pid, "edges": topo.refs[pid]}
+                    for pid in sorted(topo.refs)],
+    }
 
 
 def _validation_error(reasons: list[dict], *, gap_area: Optional[float] = None,
@@ -187,6 +247,7 @@ def initialize(req: InitRequest):
         )
 
     attributions = attribute_wells(well_geoms, parcel_geoms)
+    topo = build_topology(parcel_geoms, region_geom)   # 失败 → 500，什么都不写
 
     conn = connect()
     try:
@@ -198,6 +259,7 @@ def initialize(req: InitRequest):
                                   "message": "数据集已完成首次提交，不能重复初始化"})
             _insert_version(conn, 1, parcel_gj, attributions,
                             region=req.region, wells=well_gj)
+            _insert_topology(conn, 1, topo)
             conn.execute("INSERT INTO meta (id, current_revision) VALUES (1, 1)")
             conn.execute("COMMIT")
         except Exception:
@@ -282,7 +344,10 @@ def replace_parcels(req: ReplaceRequest):
         well_geoms[wid] = geom
     attributions = attribute_wells(well_geoms, new_geoms)
 
-    # 5) 乐观并发提交：同版并发修订只成功一份
+    # 5) 生成新版拓扑（边表 + 宗地边引用）；失败则本次发布整体作废
+    topo = build_topology(new_geoms, region_geom)
+
+    # 6) 乐观并发提交：同版并发修订只成功一份
     new_revision = current + 1
     conn = connect()
     try:
@@ -298,6 +363,7 @@ def replace_parcels(req: ReplaceRequest):
                 })
             _insert_version(conn, new_revision, new_parcel_gj, attributions,
                             region=None, wells=None)
+            _insert_topology(conn, new_revision, topo)
             cur = conn.execute(
                 "UPDATE meta SET current_revision = ? WHERE id = 1 AND current_revision = ?",
                 (new_revision, req.base_revision),
@@ -386,6 +452,56 @@ def get_wells():
     finally:
         conn.close()
     return {"revision": revision, "wells": _wells_payload(well_gj, attributions)}
+
+
+@app.get("/v1/topology/{revision}")
+def get_topology(revision: int, base: Optional[int] = None):
+    """拓扑供数：按修订号返回边表 + 每块宗地有序、带方向的边引用。
+
+    - 不带 base：返回该版完整拓扑（含历史修订）；
+    - 带 base：返回从 base 到 revision 的增量 —— 新增边、移除边、
+      变动宗地的新引用；应用到手中 base 版拓扑后与目标整版一致。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        try:
+            row = conn.execute(
+                "SELECT revision FROM versions WHERE revision = ?", (revision,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return _err(404, {"error": "revision_not_found",
+                                  "message": f"版本 {revision} 不存在"})
+            topo = _load_topology(conn, revision)
+            if topo is None:
+                conn.execute("ROLLBACK")
+                return _err(404, {"error": "topology_not_found",
+                                  "message": f"版本 {revision} 没有拓扑数据"})
+            if base is None:
+                conn.execute("COMMIT")
+                return _topology_payload(revision, topo)
+            base_row = conn.execute(
+                "SELECT revision FROM versions WHERE revision = ?", (base,),
+            ).fetchone()
+            if base_row is None:
+                conn.execute("ROLLBACK")
+                return _err(404, {"error": "revision_not_found",
+                                  "message": f"基线版本 {base} 不存在"})
+            base_topo = _load_topology(conn, base)
+            if base_topo is None:
+                conn.execute("ROLLBACK")
+                return _err(404, {"error": "topology_not_found",
+                                  "message": f"基线版本 {base} 没有拓扑数据"})
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {"revision": revision, "base_revision": base,
+            **diff_topology(base_topo, topo)}
 
 
 @app.get("/v1/revisions")
